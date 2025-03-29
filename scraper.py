@@ -288,8 +288,8 @@ class RealEstateScraper:
 
     def generate_listing_hash(self, title: str, price: float, currency: str, url: str) -> str:
         """Generate a consistent hash for a listing."""
-        hash_input = f"{title}{price}{currency}{url}"
-        return hashlib.sha256(hash_input.encode()).hexdigest()
+        # Only use URL for the hash since it's unique
+        return hashlib.sha256(url.encode()).hexdigest()
 
     def scrape_storia(self):
         """Scrape Storia website for listings"""
@@ -314,10 +314,18 @@ class RealEstateScraper:
             results = []
             for listing in listings:
                 try:
+                    # Debug: Print the first listing's HTML
+                    if len(results) == 0:
+                        logging.info(f"First listing HTML: {listing}")
+                    
                     # Extract listing details
                     title = listing.select_one(self.config['selector']['title']).text.strip()
                     price_text = listing.select_one(self.config['selector']['price']).text.strip()
                     link = listing.select_one(self.config['selector']['link'])['href']
+                    
+                    # Ensure the link has the full domain
+                    if not link.startswith('http'):
+                        link = f"https://www.storia.ro{link}"
                     
                     # Extract price and currency
                     price, currency = self.extract_price_and_currency(price_text)
@@ -330,9 +338,12 @@ class RealEstateScraper:
                     
                     # Get location if available
                     location = None
-                    location_tag = listing.select_one('p[data-cy="listing-item-location"]')
+                    location_tag = listing.select_one(self.config['selector']['location'])
                     if location_tag:
                         location = location_tag.text.strip()
+                        logging.info(f"Found location: {location}")
+                    else:
+                        logging.info(f"Location tag not found. HTML: {listing}")
                     
                     # Generate a unique hash for this listing
                     listing_hash = self.generate_listing_hash(title, price, currency, link)
@@ -358,7 +369,7 @@ class RealEstateScraper:
             logging.error(f"Error during scraping: {str(e)}")
             return []
 
-    def send_email(self, listings):
+    def send_email(self, listings, new_listings, updated_listings):
         """Send email with new listings"""
         if not listings:
             logging.info("No listings to send")
@@ -370,7 +381,7 @@ class RealEstateScraper:
             site_name = self.cursor.fetchone()[0]
             
             # Prepare email content
-            subject = f"New Real Estate Listings from {site_name} - {len(listings)} Found"
+            subject = f"Real Estate Listings from {site_name} - {len(listings)} Found"
             
             # Create email body
             body = f"""
@@ -394,24 +405,66 @@ class RealEstateScraper:
                         font-weight: bold; 
                         color: #2c5282;
                     }}
+                    .old-price {{
+                        text-decoration: line-through;
+                        color: #718096;
+                        margin-right: 10px;
+                    }}
+                    .price-increase {{
+                        color: #e53e3e;
+                    }}
+                    .price-decrease {{
+                        color: #38a169;
+                    }}
                     .location {{
                         color: #4a5568;
                         margin: 5px 0;
                     }}
+                    .new-listing {{
+                        border-left: 4px solid #48bb78;
+                    }}
+                    .updated-listing {{
+                        border-left: 4px solid #4299e1;
+                    }}
+                    .listing-type {{
+                        font-size: 0.9em;
+                        color: #718096;
+                        margin-bottom: 5px;
+                    }}
                 </style>
             </head>
             <body>
-                <h2>New Listings from {site_name}</h2>
-                <p>Found {len(listings)} new listings.</p>
+                <h2>Real Estate Listings from {site_name}</h2>
+                <p>Found {len(listings)} listings ({len(new_listings)} new, {len(updated_listings)} updated).</p>
             """
             
-            # Add all listings
-            for idx, listing in enumerate(listings, 1):
+            # First add updated listings
+            for listing in updated_listings:
+                # Use the stored old price
+                old_price = listing.get('old_price', 0)
+                price_class = 'price-increase' if listing['price'] > old_price else 'price-decrease'
                 body += f"""
                 <a href="{listing['listing_url']}" style="text-decoration: none; color: inherit; display: block;">
-                    <div class="listing">
-                        <h3>Listing #{idx}</h3>
-                        <p><strong>{listing['title']}</strong></p>
+                    <div class="listing updated-listing">
+                        <div class="listing-type">Updated Listing</div>
+                        <h3>{listing['title']}</h3>
+                        <p class="price">
+                            <span class="old-price">{old_price} {listing['currency']}</span>
+                            <span class="{price_class}">{listing['price']} {listing['currency']}</span>
+                        </p>
+                        <p class="location">Location: {listing['location'] if listing['location'] else 'Not specified'}</p>
+                        <img src="{listing['image_url']}" alt="Listing image">
+                    </div>
+                </a>
+                """
+            
+            # Then add new listings
+            for idx, listing in enumerate(new_listings, 1):
+                body += f"""
+                <a href="{listing['listing_url']}" style="text-decoration: none; color: inherit; display: block;">
+                    <div class="listing new-listing">
+                        <div class="listing-type">New Listing</div>
+                        <h3>{listing['title']}</h3>
                         <p class="price">{listing['price']} {listing['currency']}</p>
                         <p class="location">Location: {listing['location'] if listing['location'] else 'Not specified'}</p>
                         <img src="{listing['image_url']}" alt="Listing image">
@@ -453,12 +506,15 @@ class RealEstateScraper:
             
             # Filter only new listings (not already in database)
             new_listings = []
+            updated_listings = []
             for listing in storia_listings:
-                # Check if listing exists
-                self.cursor.execute('SELECT id FROM seen_listings WHERE listing_hash = ?', (listing['listing_hash'],))
-                if not self.cursor.fetchone():
-                    # Update the database with the new listing
-                    result = self.update_listing(
+                # Check if listing exists and get its current price
+                self.cursor.execute('SELECT id, price FROM seen_listings WHERE listing_hash = ?', (listing['listing_hash'],))
+                result = self.cursor.fetchone()
+                
+                if not result:
+                    # New listing
+                    self.update_listing(
                         listing['listing_hash'],
                         listing['listing_url'],
                         listing['title'],
@@ -467,20 +523,39 @@ class RealEstateScraper:
                         listing['image_url'],
                         listing['location']
                     )
-                    if result:
-                        new_listings.append(listing)
-                        logging.info(f"✓ Listing #{len(new_listings)}: {listing['title']}")
+                    new_listings.append(listing)
+                    logging.info(f"✓ Listing #{len(new_listings)}: {listing['title']}")
+                else:
+                    # Check for price changes in existing listings
+                    current_price = result[1]
+                    if current_price != listing['price']:
+                        # Store old price in the listing dict before updating
+                        listing['old_price'] = current_price
+                        # Price has changed
+                        self.update_listing(
+                            listing['listing_hash'],
+                            listing['listing_url'],
+                            listing['title'],
+                            listing['price'],
+                            listing['currency'],
+                            listing['image_url'],
+                            listing['location']
+                        )
+                        updated_listings.append(listing)
+                        logging.info(f"✓ Updated listing: {listing['title']} (Price changed from {current_price} to {listing['price']})")
             
             logging.info(f"\nSummary:")
             logging.info(f"Total listings found: {len(storia_listings)}")
-            logging.info(f"New or updated: {len(new_listings)}")
+            logging.info(f"New listings: {len(new_listings)}")
+            logging.info(f"Updated listings: {len(updated_listings)}")
             
-            if new_listings:
-                # Send email with all new listings
-                self.send_email(new_listings)
-                logging.info(f"\nSent email with {len(new_listings)} new listings")
+            if new_listings or updated_listings:
+                # Send email with all new and updated listings
+                all_listings = new_listings + updated_listings
+                self.send_email(all_listings, new_listings, updated_listings)
+                logging.info(f"\nSent email with {len(all_listings)} listings ({len(new_listings)} new, {len(updated_listings)} updated)")
             else:
-                logging.info("\nNo new listings found")
+                logging.info("\nNo new or updated listings found")
             
         except Exception as e:
             logging.error(f"Error checking new listings: {str(e)}")
@@ -521,12 +596,19 @@ class RealEstateScraper:
             
             # Store in database
             self.cursor.execute('''
-                INSERT OR REPLACE INTO seen_listings 
+                INSERT OR IGNORE INTO seen_listings 
                 (listing_hash, title, price, listing_url, image_url, location, site_id, last_seen)
                 VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
             ''', (listing_hash, title, price, url, image_url, location, self.site_id))
-            self.conn.commit()
             
+            # Update price if it has changed
+            self.cursor.execute('''
+                UPDATE seen_listings 
+                SET price = ?, last_seen = datetime('now')
+                WHERE listing_hash = ? AND price != ?
+            ''', (price, listing_hash, price))
+            
+            self.conn.commit()
             return listing_hash
             
         except Exception as e:

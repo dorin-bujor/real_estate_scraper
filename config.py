@@ -32,7 +32,8 @@ WEBSITES = [
             'listing': 'article[data-cy="listing-item"]',
             'title': 'p[data-cy="listing-item-title"]',
             'price': 'span.css-2bt9f1',
-            'link': 'a[data-cy="listing-item-link"]'
+            'link': 'a[data-cy="listing-item-link"]',
+            'location': 'div.css-12h460e p.css-42r2ms'
         }
     }
     # Add more websites here as needed
